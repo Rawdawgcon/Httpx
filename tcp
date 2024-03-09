@@ -1,0 +1,156 @@
+// TCP-based Protocol (HTTPX) Implementation in C++ with Error Handling and Encryption
+
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <cstdlib>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+// Define protocol constants
+const int PORT = 8080;
+const int BUFFER_SIZE = 1024;
+const std::string HANDSHAKE_MSG = "HTTPX_HANDSHAKE";
+const std::string RATE_LIMIT_EXCEEDED_MSG = "HTTPX_RATE_LIMIT_EXCEEDED";
+const std::string WHITELISTED_IPS[] = {"127.0.0.1", "192.168.0.1"};
+const std::string SERVER_CERT_FILE = "server.crt";
+const std::string SERVER_KEY_FILE = "server.key";
+
+// Function to perform handshake
+bool performHandshake(SSL* ssl) {
+    char buffer[BUFFER_SIZE];
+    SSL_read(ssl, buffer, BUFFER_SIZE);
+    std::string handshakeMsg(buffer);
+    return (handshakeMsg == HANDSHAKE_MSG);
+}
+
+// Function to check IP address whitelisting
+bool isWhitelisted(const std::string& clientIP) {
+    for (const std::string& ip : WHITELISTED_IPS) {
+        if (ip == clientIP) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Function to handle client requests
+void handleRequest(SSL* ssl, const std::string& clientIP) {
+    char buffer[BUFFER_SIZE];
+    SSL_read(ssl, buffer, BUFFER_SIZE);
+    std::string request(buffer);
+
+    // Perform rate limiting, IP whitelisting, and other checks here
+    if (isWhitelisted(clientIP)) {
+        SSL_write(ssl, "HTTPX_OK", strlen("HTTPX_OK"));
+    } else {
+        SSL_write(ssl, RATE_LIMIT_EXCEEDED_MSG.c_str(), RATE_LIMIT_EXCEEDED_MSG.length());
+    }
+}
+
+int main() {
+    SSL_load_error_strings();
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+
+    // Create SSL context
+    SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        std::cerr << "Error: Failed to create SSL context\n";
+        return -1;
+    }
+
+    // Load server certificate and private key
+    if (SSL_CTX_use_certificate_file(ctx, SERVER_CERT_FILE.c_str(), SSL_FILETYPE_PEM) <= 0) {
+        std::cerr << "Error: Failed to load server certificate\n";
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ctx, SERVER_KEY_FILE.c_str(), SSL_FILETYPE_PEM) <= 0) {
+        std::cerr << "Error: Failed to load server private key\n";
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+
+    // Create socket
+    int serverSock = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSock == -1) {
+        std::cerr << "Error: Failed to create socket\n";
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+
+    // Bind socket
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(PORT);
+    if (bind(serverSock, (struct sockaddr *)&serverAddr, sizeof(serverAddr)) == -1) {
+        std::cerr << "Error: Bind failed\n";
+        close(serverSock);
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+
+    // Listen for incoming connections
+    if (listen(serverSock, 5) == -1) {
+        std::cerr << "Error: Listen failed\n";
+        close(serverSock);
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+
+    std::cout << "Server listening on port " << PORT << std::endl;
+
+    // Accept incoming connections
+    sockaddr_in clientAddr;
+    socklen_t clientAddrSize = sizeof(clientAddr);
+    while (true) {
+        int clientSock = accept(serverSock, (struct sockaddr *)&clientAddr, &clientAddrSize);
+        if (clientSock == -1) {
+            std::cerr << "Error: Accept failed\n";
+            continue;
+        }
+
+        // Create SSL connection
+        SSL* ssl = SSL_new(ctx);
+        SSL_set_fd(ssl, clientSock);
+        if (SSL_accept(ssl) <= 0) {
+            std::cerr << "Error: SSL handshake failed\n";
+            SSL_free(ssl);
+            close(clientSock);
+            continue;
+        }
+
+        // Perform handshake
+        if (!performHandshake(ssl)) {
+            std::cerr << "Error: Handshake failed\n";
+            SSL_free(ssl);
+            close(clientSock);
+            continue;
+        }
+
+        // Get client IP address
+        char clientIP[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+
+        // Handle client request
+        handleRequest(ssl, clientIP);
+
+        // Close SSL connection
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+
+        // Close client socket
+        close(clientSock);
+    }
+
+    // Close server socket and cleanup
+    close(serverSock);
+    SSL_CTX_free(ctx);
+    return 0;
+}
